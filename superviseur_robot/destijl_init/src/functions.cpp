@@ -1,8 +1,6 @@
 #include "../header/functions.h"
 
 char mode_start;
-fstream flux("camera.txt", ios::in | ios::out | ios::ate);
-Camera *cam = &flux;
 
 void write_in_queue(RT_QUEUE *, MessageToMon);
 
@@ -11,7 +9,7 @@ void f_server(void *arg) {
     /* INIT */
     RT_TASK_INFO info;
     rt_task_inquire(NULL, &info);
-    printf("Init server%s\n", info.name);
+    printf("Init %s\n", info.name);
     rt_sem_p(&sem_barrier, TM_INFINITE);
 
     err = run_nodejs("/usr/local/bin/node", "/home/pi/Interface_Robot/server.js");
@@ -25,11 +23,15 @@ void f_server(void *arg) {
 #endif
         open_server();
         rt_sem_broadcast(&sem_serverOk);
+        rt_mutex_acquire(&mutex_connectionOK, TM_INFINITE);
+        connectionOK = true ;
+        rt_mutex_release(&mutex_connectionOK);
+
     }
 }
 
 void f_sendToMon(void * arg) {
-    int err;
+int err;
     MessageToMon msg;
 
     /* INIT */
@@ -42,34 +44,38 @@ void f_sendToMon(void * arg) {
     printf("%s : waiting for sem_serverOk\n", info.name);
 #endif
     rt_sem_p(&sem_serverOk, TM_INFINITE);
-    rt_mutex_acquire(&mutex_connectionOK, TM_INFINITE);
+
     
-    while (connexionOK) {
-        rt_mutex_release(&mutex_connectionOK);
+    while (1) {
+        rt_mutex_acquire(&mutex_connectionOK, TM_INFINITE);
+        if(connectionOK){
+            rt_mutex_release(&mutex_connectionOK);
 
 #ifdef _WITH_TRACE_
         printf("%s : waiting for a message in queue\n", info.name);
 #endif
-        if (rt_queue_read(&q_messageToMon, &msg, sizeof (MessageToRobot), TM_INFINITE) >= 0) {
-#ifdef _WITH_TRACE_
-            printf("%s : message {%s,%s} in queue\n", info.name, msg.header, msg.data);
-#endif
+            if (rt_queue_read(&q_messageToMon, &msg, sizeof (MessageToRobot), TM_INFINITE) >= 0) {
+  #ifdef _WITH_TRACE_
+              printf("%s : message {%s,%s} in queue\n", info.name, msg.header, msg.data);
+  #endif
 
-            err = send_message_to_monitor(msg.header, msg.data);
-            
-            if(err == -1){
-                rt_mutex_acquire(&mutex_connectionOK, TM_INFINITE);
-                connexionOK = false;
-                rt_mutex_release(&mutex_connectionOK);
-            }    
-            free_msgToMon_data(&msg);
-            rt_queue_free(&q_messageToMon, &msg);
-        } else {
-            printf("Error msg queue write: %s\n", strerror(-err));
-        }
-        rt_mutex_acquire(&mutex_connectionOK, TM_INFINITE);
+              err = send_message_to_monitor(msg.header, msg.data);
+
+              if(err == -1){
+                  rt_mutex_acquire(&mutex_connectionOK, TM_INFINITE);
+                  connectionOK = false;
+                  rt_mutex_release(&mutex_connectionOK);
+              }    
+              free_msgToMon_data(&msg);
+              rt_queue_free(&q_messageToMon, &msg);
+          } else {
+              printf("Error msg queue write: %s\n", strerror(-err));
+          }
+          rt_mutex_acquire(&mutex_connectionOK, TM_INFINITE);
+      } else {
+        rt_mutex_release(&mutex_connectionOK);
+      }
     }
-    rt_mutex_release(&mutex_connectionOK);
 }
 
 void f_receiveFromMon(void *arg) {
@@ -85,17 +91,27 @@ void f_receiveFromMon(void *arg) {
 #ifdef _WITH_TRACE_
     printf("%s : waiting for sem_serverOk\n", info.name);
 #endif
+    
     rt_sem_p(&sem_serverOk, TM_INFINITE);
+    //rt_mutex_acquire(&mutex_connectionOK, TM_INFINITE);
     do {
-        rt_mutex_release(&mutex_connectionOK);
+        //rt_mutex_release(&mutex_connectionOK);
+        
 #ifdef _WITH_TRACE_
         printf("%s : waiting for a message from monitor\n", info.name);
 #endif
+        
         err = receive_message_from_monitor(msg.header, msg.data);
         if(err == -1){
-            rt_sem_v(&sem_nodeDead, TM_INFINITE);
+            rt_mutex_acquire(&mutex_connectionOK, TM_INFINITE);
+            connectionOK = false ;
+            rt_mutex_release(&mutex_connectionOK);
+            rt_sem_v(&sem_nodeDead);
         }
         else{
+                rt_mutex_acquire(&mutex_move, TM_INFINITE);
+                move = DMB_STOP_MOVE ;
+                rt_mutex_release(&mutex_move);
 #ifdef _WITH_TRACE_
         printf("%s: msg {header:%s,data=%s} received from UI\n", info.name, msg.header, msg.data);
 #endif
@@ -177,69 +193,8 @@ void f_receiveFromMon(void *arg) {
             
         }
         rt_mutex_acquire(&mutex_connectionOK, TM_INFINITE);
-    } while (connexionOK);
+    } while (1);
     rt_mutex_release(&mutex_connectionOK);
-}
-
-void f_startCamera(void* arg){
-    int err;
-    /* INIT */
-    RT_TASK_INFO info;
-    rt_task_inquire(NULL, &info);
-    printf("Init startCamera%s\n", info.name);
-    rt_sem_p(&sem_barrier, TM_INFINITE);
-        
-#ifdef _WITH_TRACE_
-    printf("%s : waiting for sem_startCamera\n", info.name);
-#endif
-    rt_sem_p(&sem_startCamera, TM_INFINITE);
-    do {
-        err = open_camera(cam);
-        if (err == 0) {
-#ifdef _WITH_TRACE_
-            printf("%s : the camera started \n", info.name);
-#endif
-            rt_mutex_acquire(&mutex_cameraStarted, TM_INFINITE);
-            cameraStarted = true;
-            rt_mutex_release(&mutex_cameraStarted);
-            rt_sem_v(&sem_startCamera, TM_INFINITE);
-            MessageToMon msg;
-            set_msgToMon_header(&msg, HEADER_STM_ACK);
-            write_in_queue(&q_messageToMon, msg);
-        } else {
-            MessageToMon msg;
-            set_msgToMon_header(&msg, HEADER_STM_NO_ACK);
-            write_in_queue(&q_messageToMon, msg);
-        }
-        
-    }while(!cameraStarted);
-    /// FINIR ICI
-}
-
-void f_stopCamera(void* arg){
-    int err;
-    
-    /* INIT */
-    RT_TASK_INFO info;
-    rt_task_inquire(NULL, &info);
-    printf("Init stopCamera%s\n", info.name);
-    rt_sem_p(&sem_barrier, TM_INFINITE);
-        
-#ifdef _WITH_TRACE_
-    printf("%s : waiting for sem_startCamera\n", info.name);
-#endif
-    rt_sem_p(&sem_stopCamera, TM_INFINITE);
-    rt_sem_p(&sem_killCamera, TM_INFINITE);
-    do {
-        err = stop_camera(cam);
-        if(err != -1){
-            rt_mutex_acquire(&mutex_cameraStarted, TM_INFINITE);
-            cameraStarted = false;
-            rt_mutex_release(&mutex_cameraStarted);
-        }
-        rt_mutex_acquire(&mutex_cameraStarted, TM_INFINITE);
-    }while(cameraStarted);
-    rt_mutex_release(&mutex_cameraStarted);
 }
 
 void f_openComRobot(void * arg) {
@@ -248,7 +203,7 @@ void f_openComRobot(void * arg) {
     /* INIT */
     RT_TASK_INFO info;
     rt_task_inquire(NULL, &info);
-    printf("Init openComRobot%s\n", info.name);
+    printf("Init %s\n", info.name);
     rt_sem_p(&sem_barrier, TM_INFINITE);
 
     while (1) {
@@ -281,7 +236,7 @@ void f_startRobot(void * arg) {
     /* INIT */
     RT_TASK_INFO info;
     rt_task_inquire(NULL, &info);
-    printf("Init startRobot%s\n", info.name);
+    printf("Init %s\n", info.name);
     rt_sem_p(&sem_barrier, TM_INFINITE);
 
     while (1) {
@@ -292,24 +247,17 @@ void f_startRobot(void * arg) {
 #ifdef _WITH_TRACE_
         printf("%s : sem_startRobot arrived => Start robot\n", info.name);
 #endif
-        rt_mutex_acquire(&mutex_watchdog, TM_INFINITE);
-        if(watchdog){
-            rt_mutex_release(&mutex_watchdog);
-            err = send_command_to_robot(DMB_START_WITH_WD);
-        }
-        else
-            err = send_command_to_robot(DMB_START_WITHOUT_WD);
+        err = send_command_to_robot(DMB_START_WITHOUT_WD);
         if (err == 0) {
 #ifdef _WITH_TRACE_
             printf("%s : the robot is started\n", info.name);
 #endif
             rt_mutex_acquire(&mutex_robotStarted, TM_INFINITE);
-            robotStarted = true;
+            robotStarted = 1;
             rt_mutex_release(&mutex_robotStarted);
             MessageToMon msg;
             set_msgToMon_header(&msg, HEADER_STM_ACK);
             write_in_queue(&q_messageToMon, msg);
-            rt_sem_v(&sem_moveStart, TM_INFINITE);
         } else {
             MessageToMon msg;
             set_msgToMon_header(&msg, HEADER_STM_NO_ACK);
@@ -318,35 +266,13 @@ void f_startRobot(void * arg) {
     }
 }
 
-void f_stopRobot(void *arg){
-     /* INIT */
-    RT_TASK_INFO info;
-    rt_task_inquire(NULL, &info);
-    printf("Init move%s\n", info.name);
-    rt_sem_p(&sem_barrier, TM_INFINITE);
-    
-#ifdef _WITH_TRACE_
-        printf("%s : Wait sem_stopRobot\n", info.name);
-#endif
-        rt_sem_p(&sem_stopRobot, TM_INFINITE);
-        rt_sem_p(&sem_killRobot, TM_INFINITE);
-        rt_mutex_acquire(&mutex_robotStarted, TM_INFINITE);
-        if(robotStarted){
-            rt_mutex_release(&mutex_robotStarted);
-            send_command_robot(DMB_IDLE);
-            rt_mutex_acquire(&mutex_robotStarted, TM_INFINITE);
-            robotStarted = false;
-            rt_mutex_release(&mutex_robotStarted);
-        }
-    
-}
+
 
 void f_move(void *arg) {
-    int err;
     /* INIT */
     RT_TASK_INFO info;
     rt_task_inquire(NULL, &info);
-    printf("Init move%s\n", info.name);
+    printf("Init %s\n", info.name);
     rt_sem_p(&sem_barrier, TM_INFINITE);
 
     /* PERIODIC START */
@@ -366,244 +292,14 @@ void f_move(void *arg) {
         rt_mutex_acquire(&mutex_robotStarted, TM_INFINITE);
         if (robotStarted) {
             rt_mutex_acquire(&mutex_move, TM_INFINITE);
-            err = send_command_to_robot(move);
+            send_command_to_robot(move);
             rt_mutex_release(&mutex_move);
-            
-            rt_mutex_acquire(&mutex_cmpt, TM_INFINITE);
-            if(err < 0){
-                cmpt++;
-                if(cmpt == 3){
-                    rt_sem_v(&sem_stopRobot, TM_INFINITE);
-                }        
-            }
-            else{
-                cmpt = 0;
-            }
-            rt_mutex_release(&mutex_cmpt);
 #ifdef _WITH_TRACE_
             printf("%s: the movement %c was sent\n", info.name, move);
 #endif            
         }
         rt_mutex_release(&mutex_robotStarted);
     }
-}
-
-//FINIR EDITER EST FAUX
-void f_niveauBatterie(void *arg){
-    int err;
-
-    /* INIT */
-    RT_TASK_INFO info;
-    rt_task_inquire(NULL, &info);
-    printf("Init niveauBatterie%s\n", info.name);
-    rt_sem_p(&sem_barrier, TM_INFINITE);
-
-    /* PERIODIC START */
-#ifdef _WITH_TRACE_
-    printf("%s: start period\n", info.name);
-#endif
-    rt_task_set_periodic(NULL, TM_NOW, 300000000);
-    
-    while (1) {
-#ifdef _WITH_TRACE_
-        printf("%s: Wait period \n", info.name);
-#endif
-        rt_task_wait_period(NULL);
-#ifdef _WITH_TRACE_
-        printf("%s: Periodic activation\n", info.name);
-        printf("%s: niveauBatterie equals %c\n", info.name, move);
-#endif
-        rt_mutex_acquire(&mutex_robotStarted, TM_INFINITE);
-        if (robotStarted) {
-           // FINIR EDITER CEST FAUX
-            err = send_command_to_robot(DMB_GET_VBAT);
-            //FINIR EDITER EST FAUX
-            rt_mutex_acquire(&mutex_cmpt, TM_INFINITE);
-            if(levelBatterie ?? < 0 || err < 0){
-                cmpt++;
-                if(cmpt == 3)
-                    rt_sem_v(&sem_stopRobot, TM_INFINITE);
-            }
-            else{
-                cmpt = 0;
-                send_message_to_monitor(BAT, char* levelBatterie);
-            }
-            rt_mutex_release(&mutex_cmpt);
-        }
-        rt_mutex_release(&mutex_robotStarted);
-}
-    
-//FINIR CA MEC
-void f_sendCommande(void *arg){
-    int err;
-    /* INIT */
-    RT_TASK_INFO info;
-    rt_task_inquire(NULL, &info);
-    printf("Init sendCommande%s\n", info.name);
-    rt_sem_p(&sem_barrier, TM_INFINITE);
-        
-#ifdef _WITH_TRACE_
-    printf("%s : waiting for sem_ordre\n", info.name);
-#endif
-    rt_sem_p(&sem_ordre, TM_INFINITE);
-    //FINIR CA MEC
-    //send_command_to_robot(ordre);
-    //recevoir_reponse;
-    
-    rt_mutex_acquire(&mutex_cmpt, TM_INFINITE);
-    if(reponse == error){
-        cmpt = 0;
-    }
-    else{
-        cmpt++;
-        if(cmpt == 3)
-            rt_sem_v(&sem_stopRobot, TM_INFINITE);
-    }
-    rt_mutex_release(&mutex_cmpt);
-    //envoyer réponsé;
-}
-
-void f_findArena(void *arg){
-    int err;
-    /* INIT */
-    RT_TASK_INFO info;
-    rt_task_inquire(NULL, &info);
-    printf("Init sendCommande%s\n", info.name);
-    rt_sem_p(&sem_barrier, TM_INFINITE);
-        
-#ifdef _WITH_TRACE_
-    printf("%s : waiting for sem_searchArena\n", info.name);
-#endif
-    rt_sem_p(&sem_searchArena, TM_INFINITE);
-    rt_mutex_acquire(&mutex_newArena, TM_INFINITE);
-    rt_mutex_acquire(&mutex_oldArena, TM_INFINITE);
-    rt_mutex_acquire(&mutex_img, TM_INFINITE);
-    oldArena = newArena;
-    rt_mutex_release(&mutex_oldArena);
-    
-    err = detect_arena(img,newArena); // Doit-on gérer l'erreur ?
-    draw_arena(img, img, newArena);
-    
-    rt_mutex_release(&mutex_img);
-    rt_mutex_release(&mutex_newArena);
-    
-    send_message_to_monitor(IMG,img);
-}
-//FINIR
-void f_camera(void *arg){
-    int err;
-
-    /* INIT */
-    RT_TASK_INFO info;
-    rt_task_inquire(NULL, &info);
-    printf("Init camera%s\n", info.name);
-    rt_sem_p(&sem_barrier, TM_INFINITE);
-
-    /* PERIODIC START */
-#ifdef _WITH_TRACE_
-    printf("%s: start period\n", info.name);
-#endif
-    rt_task_set_periodic(NULL, TM_NOW, 300000000);
-    
-    while (1) {
-#ifdef _WITH_TRACE_
-        printf("%s: Wait period \n", info.name);
-#endif
-        rt_task_wait_period(NULL);
-#ifdef _WITH_TRACE_
-        printf("%s: Periodic activation\n", info.name);
-        printf("%s: niveauBatterie equals %c\n", info.name, move);
-#endif
-    rt_mutex_acquire(&mutex_findArena, TM_INFINITE);
-    if(!findArena){
-        rt_mutex_acquire(&mutex_cameraStarted, TM_INFINITE);
-        if(cameraStarted){
-            rt_mutex_acquire(&mutex_img, TM_INFINITE);
-            
-            err = get_image(Camera *camera, Image * monImage, const char *fichier = NULL) // gérer l'erreur
-                                                                // *fichier ???
-            rt_mutex_acquire(&mutex_newArena, TM_INFINITE);
-            rt_mutex_acquire(&mutex_oldArena, TM_INFINITE);
-            oldArena = newArena;
-            rt_mutex_release(&mutex_oldArena);
-            
-            draw_arena(img, img, newArena); 
-            
-            rt_mutex_release(&mutex_img);
-            rt_mutex_release(&mutex_newArena);
-            
-            send_message_to_monitor(IMG,img);
-        }
-        rt_mutex_release(&mutex_cameraStarted);
-    }
-    rt_mutex_release(&mutex_findArena);
-}
-
-void f_calculPosition(void *arg){
-    
-}
-
-void f_rechargementWatchdog(void *arg){
-    int err;
-    int compteur;
-    
-    /* INIT */
-    RT_TASK_INFO info;
-    rt_task_inquire(NULL, &info);
-    printf("Init rechargementWatchdog%s\n", info.name);
-    rt_sem_p(&sem_barrier, TM_INFINITE);
-
-    /* PERIODIC START */
-#ifdef _WITH_TRACE_
-    printf("%s: start period\n", info.name);
-#endif
-    rt_task_set_periodic(NULL, TM_NOW, 1000000000);
-    compteur = 0;
-    while (1) {
-#ifdef _WITH_TRACE_
-        printf("%s: Wait period \n", info.name);
-#endif
-        rt_task_wait_period(NULL);
-#ifdef _WITH_TRACE_
-        printf("%s: Periodic activation\n", info.name);
-        printf("%s: niveauBatterie equals %c\n", info.name, move);
-#endif
-        
-       rt_mutex_acquire(&mutex_robotStarted, TM_INFINITE);
-       rt_mutex_acquire(&mutex_watchdog, TM_INFINITE);
-       while(robotStarted && watchdog){
-           send_command_to_robot(DMB_RELOAD_WD);
-           err = (&sem_ordre, TM_INFINITE);
-           if(err == ROBOT_ERROR || err == ROBOT_TIMED_OUT){
-               compteur++;
-               if(compteur == 3)
-                   rt_sem_v(&sem_stopRobot, TM_INFINITE);
-           }
-           else{
-               compteur--;
-           }
-       }
-}
-
-//Mmmmmh
-void f_ripNodejs(void *arg){
-    int err;
-    /* INIT */
-    RT_TASK_INFO info;
-    rt_task_inquire(NULL, &info);
-    printf("Init ripNodejs%s\n", info.name);
-    rt_sem_p(&sem_barrier, TM_INFINITE);
-    
-#ifdef _WITH_TRACE_
-    printf("%s : waiting for sem_nodeDead\n", info.name);
-#endif
-    rt_sem_p(&sem_nodeDead, TM_INFINITE);
-    rt_mutex_acquire(&mutex_connectionOK, TM_INFINITE);
-    if(!conectionOK){
-        rt_sem_v(&sem_killRobot, TM_INFINITE);//Mmmmmh 
-        rt_sem_v(&sem_killCamera, TM_INFINITE);//Mmmmmmh
-    }
-    rt_mutex_release(&mutex_connectionOK);
 }
 
 void write_in_queue(RT_QUEUE *queue, MessageToMon msg) {
